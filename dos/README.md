@@ -21,4 +21,5 @@ The executable lands in `build/DOSSRV.EXE`.
 4. Press `Ctrl+Break` to stop the server if needed.
 
 Once active the program waits for framed commands and serves directory listings,
-stat information, file reads, writes, and truncation requests from the host.
+stat information, file reads/writes, truncation, and directory/file maintenance
+requests (mkdir, rmdir, delete) from the host.

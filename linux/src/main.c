@@ -68,6 +68,10 @@ static int dosmnt_release(const char *path, struct fuse_file_info *fi);
 static int dosmnt_chmod(const char *path, mode_t mode, struct fuse_file_info *fi);
 static int dosmnt_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi);
 static int dosmnt_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
+static int dosmnt_unlink(const char *path);
+static int dosmnt_mkdir(const char *path, mode_t mode);
+static int dosmnt_rmdir(const char *path);
+static int send_simple_path(struct dosmnt_context *ctx, uint8_t opcode, const char *remote);
 static int dosmnt_statfs(const char *path, struct statvfs *stbuf);
 
 static const struct fuse_operations dosmnt_ops = {
@@ -79,6 +83,9 @@ static const struct fuse_operations dosmnt_ops = {
     .write = dosmnt_write,
     .truncate = dosmnt_truncate,
     .release = dosmnt_release,
+    .unlink = dosmnt_unlink,
+    .mkdir = dosmnt_mkdir,
+    .rmdir = dosmnt_rmdir,
     .chmod = dosmnt_chmod,
     .chown = dosmnt_chown,
     .utimens = dosmnt_utimens,
@@ -347,6 +354,10 @@ static int status_to_errno(uint8_t status) {
             return -EOVERFLOW;
         case DOSMNT_STATUS_TOO_LARGE:
             return -EFBIG;
+        case DOSMNT_STATUS_EXISTS:
+            return -EEXIST;
+        case DOSMNT_STATUS_NOT_EMPTY:
+            return -ENOTEMPTY;
         default:
             return -EIO;
     }
@@ -638,6 +649,29 @@ static int set_remote_length(struct dosmnt_context *ctx, const char *remote, uin
     }
     return 0;
 }
+
+static int send_simple_path(struct dosmnt_context *ctx, uint8_t opcode, const char *remote) {
+    uint8_t payload[DOSMNT_MAX_PATH];
+    uint8_t response[1];
+    uint8_t status = 0;
+    uint16_t resp_len = sizeof(response);
+    size_t len = strlen(remote) + 1;
+
+    if (len > DOSMNT_MAX_PATH) {
+        return -ENAMETOOLONG;
+    }
+
+    memcpy(payload, remote, len);
+    int rc = dosmnt_client_request(&ctx->client, opcode, payload, (uint16_t)len,
+                                   &status, response, &resp_len);
+    if (rc != 0) {
+        return rc;
+    }
+    if (status != DOSMNT_STATUS_OK) {
+        return status_to_errno(status);
+    }
+    return 0;
+}
 static int dosmnt_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
     (void)mode;
@@ -785,4 +819,29 @@ static int dosmnt_utimens(const char *path, const struct timespec tv[2], struct 
     (void)fi;
     trace_msg(ctx, "utimens %s (noop)", path);
     return 0;
+}
+
+static int dosmnt_unlink(const char *path) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    char remote[DOSMNT_MAX_PATH];
+    trace_msg(ctx, "unlink %s", path);
+    build_remote_path(ctx, path, remote);
+    return send_simple_path(ctx, DOSMNT_OP_DELETE, remote);
+}
+
+static int dosmnt_mkdir(const char *path, mode_t mode) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    char remote[DOSMNT_MAX_PATH];
+    (void)mode;
+    trace_msg(ctx, "mkdir %s", path);
+    build_remote_path(ctx, path, remote);
+    return send_simple_path(ctx, DOSMNT_OP_MKDIR, remote);
+}
+
+static int dosmnt_rmdir(const char *path) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    char remote[DOSMNT_MAX_PATH];
+    trace_msg(ctx, "rmdir %s", path);
+    build_remote_path(ctx, path, remote);
+    return send_simple_path(ctx, DOSMNT_OP_RMDIR, remote);
 }

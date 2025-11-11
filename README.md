@@ -39,6 +39,9 @@ of their payload for a status code (`0` = success).
 | `0x13` (`READ`)  | `uint32_t offset`, `uint16_t length`, path     | status, raw file bytes (length <= 1024)                          |
 | `0x14` (`WRITE`) | `uint32_t offset`, `uint16_t length`, path, raw bytes | status only; data is written verbatim at the requested offset |
 | `0x15` (`SETLEN`)| `uint32_t new_size`, path                      | status only (used for create/truncate)                           |
+| `0x16` (`MKDIR`) | Zero-terminated DOS path                       | status only                                                      |
+| `0x17` (`RMDIR`) | Zero-terminated DOS path                       | status only                                                      |
+| `0x18` (`DELETE`)| Zero-terminated DOS path                       | status only (removes files)                                      |
 | `0x1F` (`BYE`)   | none                                           | status only                                                      |
 
 For `WRITE`, the payload mirrors `READ` with an additional data blob: the path

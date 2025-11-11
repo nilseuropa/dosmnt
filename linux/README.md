@@ -3,7 +3,8 @@
 `dosmnt_host` is a small FUSE filesystem that speaks the same serial protocol as
 the DOS resident server. Once connected it presents the remote FAT tree as a
 mount point on the Linux machine, allowing you to read from and write to the
-DOS volume over a single serial cable.
+DOS volume over a single serial cable. Common POSIX operations—`mkdir`, `rmdir`,
+`unlink`, `truncate`, and plain file reads/writes—are forwarded over the link.
 
 ## Dependencies
 

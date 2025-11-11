@@ -18,6 +18,9 @@ enum dosmnt_opcode {
     DOSMNT_OP_READ  = 0x13,
     DOSMNT_OP_WRITE = 0x14,
     DOSMNT_OP_SETLEN = 0x15,
+    DOSMNT_OP_MKDIR = 0x16,
+    DOSMNT_OP_RMDIR = 0x17,
+    DOSMNT_OP_DELETE = 0x18,
     DOSMNT_OP_BYE   = 0x1F
 };
 
@@ -29,7 +32,9 @@ enum dosmnt_status {
     DOSMNT_STATUS_IO_ERROR     = 0x04,
     DOSMNT_STATUS_NO_SPACE     = 0x05,
     DOSMNT_STATUS_TOO_LARGE    = 0x06,
-    DOSMNT_STATUS_INTERNAL     = 0x07
+    DOSMNT_STATUS_INTERNAL     = 0x07,
+    DOSMNT_STATUS_EXISTS       = 0x08,
+    DOSMNT_STATUS_NOT_EMPTY    = 0x09
 };
 
 enum dosmnt_dirent_type {

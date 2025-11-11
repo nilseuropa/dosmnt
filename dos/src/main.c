@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <direct.h>
 
 #include "dos_serial.h"
 #include "dosmnt/protocol.h"
@@ -237,6 +238,7 @@ static void send_status(uint8_t opcode, uint8_t seq, uint8_t status,
 
 static void normalize_path(char *path);
 static int is_drive_root(const char *path);
+static int is_current_directory(const char *path);
 
 static uint32_t pack_dos_timestamp(uint16_t date, uint16_t time) {
     return ((uint32_t)date << 16) | (uint32_t)time;
@@ -323,6 +325,10 @@ static int is_drive_root(const char *path) {
            strlen(path) == 3 &&
            path[1] == ':' &&
            path[2] == '\\';
+}
+
+static int is_current_directory(const char *path) {
+    return path != NULL && strcmp(path, ".\\") == 0;
 }
 
 static void make_directory_pattern(const char *input, char *pattern) {
@@ -685,6 +691,132 @@ static void process_setlen(const struct dosmnt_frame *frame) {
     send_status(frame->opcode, frame->seq, status, NULL, 0);
 }
 
+static uint8_t validate_modifiable_path(const char *path) {
+    if (is_current_directory(path) || is_drive_root(path)) {
+        return DOSMNT_STATUS_MALFORMED;
+    }
+    return DOSMNT_STATUS_OK;
+}
+
+static void process_mkdir(const struct dosmnt_frame *frame) {
+    char path[DOSMNT_MAX_PATH];
+    uint8_t status;
+
+    status = read_path_string(frame->payload, frame->length, 0, path, NULL);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    normalize_path(path);
+    tracef("[dosmnt] MKDIR path=%s\r\n", path);
+
+    status = validate_modifiable_path(path);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    if (_mkdir(path) == 0) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
+        return;
+    }
+
+    switch (errno) {
+        case ENOENT:
+            status = DOSMNT_STATUS_NOT_FOUND;
+            break;
+        case EEXIST:
+            status = DOSMNT_STATUS_EXISTS;
+            break;
+        default:
+            status = DOSMNT_STATUS_IO_ERROR;
+            break;
+    }
+    send_status(frame->opcode, frame->seq, status, NULL, 0);
+}
+
+static void process_rmdir(const struct dosmnt_frame *frame) {
+    char path[DOSMNT_MAX_PATH];
+    uint8_t status;
+
+    status = read_path_string(frame->payload, frame->length, 0, path, NULL);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    normalize_path(path);
+    tracef("[dosmnt] RMDIR path=%s\r\n", path);
+
+    status = validate_modifiable_path(path);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    if (_rmdir(path) == 0) {
+        if (g_active_file != NULL && strcmp(g_active_path, path) == 0) {
+            reset_active_file();
+        }
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
+        return;
+    }
+
+    switch (errno) {
+        case ENOENT:
+            status = DOSMNT_STATUS_NOT_FOUND;
+            break;
+#ifdef ENOTEMPTY
+        case ENOTEMPTY:
+            status = DOSMNT_STATUS_NOT_EMPTY;
+            break;
+#endif
+        default:
+            status = DOSMNT_STATUS_IO_ERROR;
+            break;
+    }
+    send_status(frame->opcode, frame->seq, status, NULL, 0);
+}
+
+static void process_delete(const struct dosmnt_frame *frame) {
+    char path[DOSMNT_MAX_PATH];
+    uint8_t status;
+
+    status = read_path_string(frame->payload, frame->length, 0, path, NULL);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    normalize_path(path);
+    tracef("[dosmnt] DELETE path=%s\r\n", path);
+
+    status = validate_modifiable_path(path);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    if (_unlink(path) == 0) {
+        if (g_active_file != NULL && strcmp(g_active_path, path) == 0) {
+            reset_active_file();
+        }
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
+        return;
+    }
+
+    switch (errno) {
+        case ENOENT:
+            status = DOSMNT_STATUS_NOT_FOUND;
+            break;
+        default:
+            status = DOSMNT_STATUS_IO_ERROR;
+            break;
+    }
+    send_status(frame->opcode, frame->seq, status, NULL, 0);
+}
+
 static void process_frame(const struct dosmnt_frame *frame) {
     switch (frame->opcode) {
         case DOSMNT_OP_HELLO:
@@ -704,6 +836,15 @@ static void process_frame(const struct dosmnt_frame *frame) {
             break;
         case DOSMNT_OP_SETLEN:
             process_setlen(frame);
+            break;
+        case DOSMNT_OP_MKDIR:
+            process_mkdir(frame);
+            break;
+        case DOSMNT_OP_RMDIR:
+            process_rmdir(frame);
+            break;
+        case DOSMNT_OP_DELETE:
+            process_delete(frame);
             break;
         case DOSMNT_OP_BYE:
             reset_active_file();
