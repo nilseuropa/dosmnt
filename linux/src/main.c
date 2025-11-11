@@ -352,6 +352,8 @@ static int dosmnt_getattr(const char *path, struct stat *stbuf, struct fuse_file
     stbuf->st_size = st.size;
     stbuf->st_mtime = stbuf->st_atime = stbuf->st_ctime = dos_time_to_unix(st.write_time);
 
+    trace_msg(ctx, "getattr %s -> size=%lu attrs=0x%02X", path, (unsigned long)st.size, st.attributes);
+
     if (S_ISDIR(stbuf->st_mode)) {
         stbuf->st_size = 4096;
     }
@@ -444,10 +446,9 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
     char remote[DOSMNT_MAX_PATH];
     uint8_t payload[6 + DOSMNT_MAX_PATH];
     uint8_t response[DOSMNT_MAX_PAYLOAD];
-    uint16_t payload_len;
-    uint16_t resp_len = sizeof(response);
     uint8_t status;
-    size_t chunk = size;
+    size_t remaining = size;
+    size_t total_read = 0;
     int rc;
 
     (void)fi;
@@ -457,41 +458,55 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
         return -EOVERFLOW;
     }
 
-    if (chunk > DOSMNT_MAX_DATA) {
-        chunk = DOSMNT_MAX_DATA;
-    }
-
     build_remote_path(ctx, path, remote);
 
-    payload[0] = (uint8_t)(offset & 0xFF);
-    payload[1] = (uint8_t)(((uint64_t)offset >> 8) & 0xFF);
-    payload[2] = (uint8_t)(((uint64_t)offset >> 16) & 0xFF);
-    payload[3] = (uint8_t)(((uint64_t)offset >> 24) & 0xFF);
-    payload[4] = (uint8_t)(chunk & 0xFF);
-    payload[5] = (uint8_t)((chunk >> 8) & 0xFF);
+    while (remaining > 0) {
+        size_t chunk = remaining;
+        uint16_t payload_len;
+        uint16_t resp_len = sizeof(response);
 
-    payload_len = (uint16_t)(6 + strlen(remote) + 1);
-    memcpy(payload + 6, remote, payload_len - 6);
+        if (chunk > DOSMNT_MAX_DATA) {
+            chunk = DOSMNT_MAX_DATA;
+        }
 
-    rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_READ, payload, payload_len,
-                               &status, response, &resp_len);
-    if (rc != 0) {
-        return rc;
-    }
-    if (status != DOSMNT_STATUS_OK) {
-        return status_to_errno(status);
-    }
-    if (resp_len < 1) {
-        return -EIO;
+        payload[0] = (uint8_t)(offset & 0xFF);
+        payload[1] = (uint8_t)(((uint64_t)offset >> 8) & 0xFF);
+        payload[2] = (uint8_t)(((uint64_t)offset >> 16) & 0xFF);
+        payload[3] = (uint8_t)(((uint64_t)offset >> 24) & 0xFF);
+        payload[4] = (uint8_t)(chunk & 0xFF);
+        payload[5] = (uint8_t)((chunk >> 8) & 0xFF);
+
+        payload_len = (uint16_t)(6 + strlen(remote) + 1);
+        memcpy(payload + 6, remote, payload_len - 6);
+
+        rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_READ, payload, payload_len,
+                                   &status, response, &resp_len);
+        if (rc != 0) {
+            return (total_read > 0) ? (int)total_read : rc;
+        }
+        if (status != DOSMNT_STATUS_OK) {
+            return (total_read > 0) ? (int)total_read : status_to_errno(status);
+        }
+        if (resp_len < 1) {
+            return (total_read > 0) ? (int)total_read : -EIO;
+        }
+
+        resp_len--; /* skip status byte */
+        if (resp_len > chunk) {
+            resp_len = chunk;
+        }
+
+        memcpy(buf + total_read, response + 1, resp_len);
+        total_read += resp_len;
+        offset += resp_len;
+        remaining -= resp_len;
+
+        if (resp_len < chunk) {
+            break; /* EOF */
+        }
     }
 
-    resp_len--; /* skip status byte */
-    if (resp_len > size) {
-        resp_len = (uint16_t)size;
-    }
-    memcpy(buf, response + 1, resp_len);
-
-    return (int)resp_len;
+    return (int)total_read;
 }
 
 static int dosmnt_statfs(const char *path, struct statvfs *stbuf) {

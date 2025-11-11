@@ -6,6 +6,7 @@
 #include <io.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,18 @@ struct dosmnt_frame {
 };
 
 static volatile int g_keep_running = 1;
+static FILE *g_trace_file = NULL;
+static FILE *g_active_file = NULL;
+static char g_active_path[DOSMNT_MAX_PATH];
+
+#define TRACE_LOG_NAME "DOSSRV.LOG"
 static int g_trace = 0;
+
+static void tracef(const char *fmt, ...);
+static void log_line(const char *text);
+static void init_trace_log(void);
+static void close_trace_log(void);
+static void reset_active_file(void);
 
 static void tracef(const char *fmt, ...) {
     va_list ap;
@@ -34,6 +46,37 @@ static void tracef(const char *fmt, ...) {
     va_start(ap, fmt);
     vprintf(fmt, ap);
     va_end(ap);
+
+    if (g_trace_file != NULL) {
+        va_start(ap, fmt);
+        vfprintf(g_trace_file, fmt, ap);
+        fflush(g_trace_file);
+        va_end(ap);
+    }
+}
+
+static void log_line(const char *text) {
+    if (g_trace_file != NULL) {
+        fputs(text, g_trace_file);
+        fflush(g_trace_file);
+    }
+}
+
+static void init_trace_log(void) {
+    g_trace_file = fopen(TRACE_LOG_NAME, "wt");
+    if (g_trace_file != NULL) {
+        log_line("DOSMNT trace log started\r\n");
+    } else {
+        printf("Warning: unable to create %s\r\n", TRACE_LOG_NAME);
+    }
+}
+
+static void close_trace_log(void) {
+    if (g_trace_file != NULL) {
+        log_line("DOSMNT trace log closed\r\n");
+        fclose(g_trace_file);
+        g_trace_file = NULL;
+    }
 }
 
 static uint8_t compute_checksum(uint8_t opcode, uint8_t seq, uint16_t length, const uint8_t *payload) {
@@ -77,7 +120,12 @@ static int wait_for_serial_byte(uint8_t *value) {
             int ch = getch();
             if (ch == 't' || ch == 'T') {
                 g_trace = !g_trace;
-                printf("\r\n[trace %s]\r\n", g_trace ? "on" : "off");
+                printf("\r\n[trace %s]%s\r\n",
+                       g_trace ? "on" : "off",
+                       (g_trace && g_trace_file) ? " (logging to " TRACE_LOG_NAME ")" : "");
+                if (g_trace_file != NULL) {
+                    log_line(g_trace ? "[trace on]\r\n" : "[trace off]\r\n");
+                }
                 continue;
             }
             if (ch == 0x1B || ch == 0x03) {
@@ -174,6 +222,9 @@ static void send_status(uint8_t opcode, uint8_t seq, uint8_t status,
     serial_send_frame(dosmnt_response_opcode(opcode), seq, buffer, data_len + 1);
 }
 
+static void normalize_path(char *path);
+static int is_drive_root(const char *path);
+
 static uint32_t pack_dos_timestamp(uint16_t date, uint16_t time) {
     return ((uint32_t)date << 16) | (uint32_t)time;
 }
@@ -218,6 +269,45 @@ static uint8_t read_path_string(const uint8_t *payload, uint16_t length, uint16_
     return DOSMNT_STATUS_OK;
 }
 
+static void normalize_path(char *path) {
+    size_t len;
+
+    if (path == NULL) {
+        return;
+    }
+
+    len = strlen(path);
+    if (len == 0) {
+        strcpy(path, ".\\");
+        return;
+    }
+
+    if (len == 2 && path[1] == ':') {
+        path[2] = '\\';
+        path[3] = '\0';
+        return;
+    }
+
+    if (len > 0 && path[len - 1] == '\\') {
+        if (!(len == 3 && path[1] == ':' && path[2] == '\\')) {
+            path[len - 1] = '\0';
+        }
+    }
+
+    len = strlen(path);
+    if (len == 2 && path[1] == ':') {
+        path[2] = '\\';
+        path[3] = '\0';
+    }
+}
+
+static int is_drive_root(const char *path) {
+    return path != NULL &&
+           strlen(path) == 3 &&
+           path[1] == ':' &&
+           path[2] == '\\';
+}
+
 static void make_directory_pattern(const char *input, char *pattern) {
     size_t len;
 
@@ -246,35 +336,21 @@ static void make_directory_pattern(const char *input, char *pattern) {
     }
 }
 
-static uint8_t handle_stat(const char *path, struct dosmnt_stat *out_stat) {
+static uint8_t handle_stat(char *path, struct dosmnt_stat *out_stat) {
     struct find_t info;
     unsigned attr_mask = _A_NORMAL | _A_RDONLY | _A_HIDDEN | _A_SYSTEM |
                          _A_ARCH | _A_SUBDIR;
-    char normalized[DOSMNT_MAX_PATH];
-    size_t len;
+    normalize_path(path);
 
-    strncpy(normalized, path, sizeof(normalized) - 1);
-    normalized[sizeof(normalized) - 1] = '\0';
-    len = strlen(normalized);
-
-    if (len > 0 && normalized[len - 1] == '\\') {
-        if (!(len == 3 && normalized[1] == ':' && normalized[2] == '\\')) {
-            normalized[len - 1] = '\0';
-        }
-    }
-
-    if (strlen(normalized) == 2 && normalized[1] == ':') {
-        strcat(normalized, "\\");
-    }
-
-    if (strlen(normalized) == 3 && normalized[1] == ':' && normalized[2] == '\\') {
+    if (is_drive_root(path)) {
         out_stat->attributes = DOS_ATTR_DIRECTORY;
         out_stat->size = 0;
         out_stat->write_time = 0;
         return DOSMNT_STATUS_OK;
     }
 
-    if (_dos_findfirst(normalized, attr_mask, &info) != 0) {
+    if (_dos_findfirst(path, attr_mask, &info) != 0) {
+        tracef("[dosmnt] findfirst miss path=%s\r\n", path);
         return DOSMNT_STATUS_NOT_FOUND;
     }
 
@@ -289,6 +365,8 @@ static void process_hello(const struct dosmnt_frame *frame) {
     uint8_t payload[40];
     struct find_t info;
     unsigned attr_mask = _A_VOLID;
+    unsigned drive = 0;
+    char pattern[6] = "A:\\*.*";
     int done;
 
     payload[0] = DOSMNT_STATUS_OK;
@@ -297,7 +375,12 @@ static void process_hello(const struct dosmnt_frame *frame) {
     payload[3] = 0x00;
     memset(payload + 4, 0, 32);
 
-    done = _dos_findfirst("*.*", attr_mask, &info);
+    _dos_getdrive(&drive);
+    if (drive >= 1 && drive <= 26) {
+        pattern[0] = (char)('A' + drive - 1);
+    }
+
+    done = _dos_findfirst(pattern, attr_mask, &info);
     if (done == 0) {
         strncpy((char *)(payload + 4), info.name, 31);
     }
@@ -321,6 +404,8 @@ static void process_list(const struct dosmnt_frame *frame) {
         return;
     }
 
+    normalize_path(path);
+    tracef("[dosmnt] LIST path=%s\r\n", path);
     make_directory_pattern(path, pattern);
 
     if (_dos_findfirst(pattern, attr_mask, &info) != 0) {
@@ -375,6 +460,7 @@ static void process_stat(const struct dosmnt_frame *frame) {
         return;
     }
 
+    tracef("[dosmnt] STAT path=%s\r\n", path);
     status = handle_stat(path, &st);
     if (status != DOSMNT_STATUS_OK) {
         send_status(frame->opcode, frame->seq, status, NULL, 0);
@@ -390,7 +476,6 @@ static void process_read(const struct dosmnt_frame *frame) {
     uint16_t chunk_len;
     char path[DOSMNT_MAX_PATH];
     uint8_t status;
-    FILE *fp = NULL;
     uint8_t buffer[DOSMNT_MAX_PAYLOAD];
     size_t bytes_read;
 
@@ -416,21 +501,33 @@ static void process_read(const struct dosmnt_frame *frame) {
         return;
     }
 
-    fp = fopen(path, "rb");
-    if (fp == NULL) {
-        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_NOT_FOUND, NULL, 0);
-        return;
+    normalize_path(path);
+
+    tracef("[dosmnt] READ path=%s offset=%lu len=%u\r\n",
+           path, offset, (unsigned)chunk_len);
+
+    if (offset == 0 || g_active_file == NULL ||
+        strcmp(g_active_path, path) != 0) {
+        reset_active_file();
+        g_active_file = fopen(path, "rb");
+        if (g_active_file == NULL) {
+            tracef("[dosmnt] fopen failed errno=%d path=%s\r\n", errno, path);
+            send_status(frame->opcode, frame->seq, DOSMNT_STATUS_NOT_FOUND, NULL, 0);
+            return;
+        }
+        strncpy(g_active_path, path, sizeof(g_active_path) - 1);
+        g_active_path[sizeof(g_active_path) - 1] = '\0';
     }
 
-    if (fseek(fp, (long)offset, SEEK_SET) != 0) {
-        fclose(fp);
+    if (fseek(g_active_file, (long)offset, SEEK_SET) != 0) {
+        tracef("[dosmnt] fseek failed errno=%d path=%s offset=%lu\r\n",
+               errno, path, offset);
+        reset_active_file();
         send_status(frame->opcode, frame->seq, DOSMNT_STATUS_IO_ERROR, NULL, 0);
         return;
     }
 
-    bytes_read = fread(buffer, 1, chunk_len, fp);
-    fclose(fp);
-
+    bytes_read = fread(buffer, 1, chunk_len, g_active_file);
     send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, buffer, (uint16_t)bytes_read);
 }
 
@@ -449,6 +546,7 @@ static void process_frame(const struct dosmnt_frame *frame) {
             process_read(frame);
             break;
         case DOSMNT_OP_BYE:
+            reset_active_file();
             send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
             break;
         default: {
@@ -461,8 +559,13 @@ static void process_frame(const struct dosmnt_frame *frame) {
 int main(void) {
     struct dosmnt_frame frame;
 
+    init_trace_log();
+
     printf("DOSMNT resident server starting (Ctrl+Break to exit)\r\n");
     printf("Press 'T' to toggle trace output.\r\n");
+    if (g_trace_file != NULL) {
+        printf("Trace log file: %s\r\n", TRACE_LOG_NAME);
+    }
 
     serial_init(SERIAL_DEFAULT_PORT, SERIAL_DEFAULT_BAUD);
 
@@ -474,5 +577,14 @@ int main(void) {
     }
 
     printf("\r\nDOSMNT server stopped.\r\n");
+    reset_active_file();
+    close_trace_log();
     return 0;
+}
+static void reset_active_file(void) {
+    if (g_active_file != NULL) {
+        fclose(g_active_file);
+        g_active_file = NULL;
+        g_active_path[0] = '\0';
+    }
 }
