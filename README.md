@@ -80,7 +80,7 @@ equivalent for your distribution) is installed, then:
 cd linux
 cmake -S . -B build
 cmake --build build
-sudo build/dosmnt_host --device /dev/ttyUSB0 --mount /mnt/dos
+sudo build/dosmnt --device /dev/ttyUSB0 --mount /mnt/dos
 ```
 
 Unmount with `fusermount3 -u /mnt/dos` when done.
