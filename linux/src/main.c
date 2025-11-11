@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fuse3/fuse.h>
 #include <getopt.h>
 #include <stdbool.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "dosmnt/protocol.h"
@@ -32,6 +34,11 @@ struct dosmnt_context {
     int debug;
 };
 
+struct dosmnt_file_handle {
+    char remote[DOSMNT_MAX_PATH];
+    int flags;
+};
+
 static int parse_options(int argc, char **argv, struct cli_options *out,
                          int *fuse_argc, char ***fuse_argv);
 static int perform_handshake(struct dosmnt_context *ctx);
@@ -40,6 +47,11 @@ static mode_t attrs_to_mode(uint8_t attrs);
 static time_t dos_time_to_unix(uint32_t packed);
 static int status_to_errno(uint8_t status);
 static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...);
+static struct dosmnt_file_handle *alloc_file_handle(const struct dosmnt_context *ctx,
+                                                    const char *path, int flags);
+static void free_file_handle(struct dosmnt_file_handle *fh);
+static struct dosmnt_file_handle *file_handle_from_fi(struct fuse_file_info *fi);
+static int set_remote_length(struct dosmnt_context *ctx, const char *remote, uint32_t size);
 
 static int dosmnt_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi);
 static int dosmnt_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -48,6 +60,14 @@ static int dosmnt_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static int dosmnt_open(const char *path, struct fuse_file_info *fi);
 static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi);
+static int dosmnt_create(const char *path, mode_t mode, struct fuse_file_info *fi);
+static int dosmnt_write(const char *path, const char *buf, size_t size, off_t offset,
+                        struct fuse_file_info *fi);
+static int dosmnt_truncate(const char *path, off_t size, struct fuse_file_info *fi);
+static int dosmnt_release(const char *path, struct fuse_file_info *fi);
+static int dosmnt_chmod(const char *path, mode_t mode, struct fuse_file_info *fi);
+static int dosmnt_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi);
+static int dosmnt_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
 static int dosmnt_statfs(const char *path, struct statvfs *stbuf);
 
 static const struct fuse_operations dosmnt_ops = {
@@ -55,7 +75,13 @@ static const struct fuse_operations dosmnt_ops = {
     .readdir = dosmnt_readdir,
     .open = dosmnt_open,
     .read = dosmnt_read,
-    .release = NULL,
+    .create = dosmnt_create,
+    .write = dosmnt_write,
+    .truncate = dosmnt_truncate,
+    .release = dosmnt_release,
+    .chmod = dosmnt_chmod,
+    .chown = dosmnt_chown,
+    .utimens = dosmnt_utimens,
     .statfs = dosmnt_statfs,
 };
 
@@ -270,9 +296,17 @@ static void build_remote_path(const struct dosmnt_context *ctx, const char *fuse
 
 static mode_t attrs_to_mode(uint8_t attrs) {
     if (attrs & DOS_ATTR_DIRECTORY) {
-        return S_IFDIR | 0555;
+        mode_t mode = S_IFDIR | 0555;
+        if ((attrs & DOS_ATTR_READONLY) == 0) {
+            mode |= 0222;
+        }
+        return mode;
     }
-    return S_IFREG | 0444;
+    mode_t mode = S_IFREG | 0444;
+    if ((attrs & DOS_ATTR_READONLY) == 0) {
+        mode |= 0222;
+    }
+    return mode;
 }
 
 static time_t dos_time_to_unix(uint32_t packed) {
@@ -437,6 +471,15 @@ static int dosmnt_open(const char *path, struct fuse_file_info *fi) {
         return -EISDIR;
     }
 
+    if (!fi) {
+        return 0;
+    }
+
+    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path, fi->flags);
+    if (!fh) {
+        return -ENOMEM;
+    }
+    fi->fh = (uint64_t)(uintptr_t)fh;
     return 0;
 }
 
@@ -444,6 +487,7 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
                        struct fuse_file_info *fi) {
     struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
     char remote[DOSMNT_MAX_PATH];
+    const char *remote_path;
     uint8_t payload[6 + DOSMNT_MAX_PATH];
     uint8_t response[DOSMNT_MAX_PAYLOAD];
     uint8_t status;
@@ -458,12 +502,21 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
         return -EOVERFLOW;
     }
 
-    build_remote_path(ctx, path, remote);
+    struct dosmnt_file_handle *fh = file_handle_from_fi(fi);
+    if (fh) {
+        remote_path = fh->remote;
+    } else {
+        build_remote_path(ctx, path, remote);
+        remote_path = remote;
+    }
 
     while (remaining > 0) {
         size_t chunk = remaining;
         uint16_t payload_len;
         uint16_t resp_len = sizeof(response);
+        if (offset > 0xFFFFFFFFLL) {
+            return (total_read > 0) ? (int)total_read : -EOVERFLOW;
+        }
 
         if (chunk > DOSMNT_MAX_DATA) {
             chunk = DOSMNT_MAX_DATA;
@@ -476,8 +529,9 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
         payload[4] = (uint8_t)(chunk & 0xFF);
         payload[5] = (uint8_t)((chunk >> 8) & 0xFF);
 
-        payload_len = (uint16_t)(6 + strlen(remote) + 1);
-        memcpy(payload + 6, remote, payload_len - 6);
+        size_t path_len = strlen(remote_path) + 1;
+        payload_len = (uint16_t)(6 + path_len);
+        memcpy(payload + 6, remote_path, path_len);
 
         rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_READ, payload, payload_len,
                                    &status, response, &resp_len);
@@ -520,7 +574,7 @@ static int dosmnt_statfs(const char *path, struct statvfs *stbuf) {
     stbuf->f_files = 0;
     stbuf->f_ffree = 0;
     stbuf->f_favail = 0;
-    stbuf->f_flag = ST_RDONLY | ST_NOSUID;
+    stbuf->f_flag = ST_NOSUID;
     stbuf->f_namemax = 12;
     return 0;
 }
@@ -535,4 +589,200 @@ static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+}
+static struct dosmnt_file_handle *alloc_file_handle(const struct dosmnt_context *ctx,
+                                                    const char *path, int flags) {
+    struct dosmnt_file_handle *fh = calloc(1, sizeof(*fh));
+    if (!fh) {
+        return NULL;
+    }
+    build_remote_path(ctx, path, fh->remote);
+    fh->flags = flags;
+    return fh;
+}
+
+static void free_file_handle(struct dosmnt_file_handle *fh) {
+    if (fh) {
+        free(fh);
+    }
+}
+
+static struct dosmnt_file_handle *file_handle_from_fi(struct fuse_file_info *fi) {
+    if (!fi) {
+        return NULL;
+    }
+    return (struct dosmnt_file_handle *)(uintptr_t)fi->fh;
+}
+
+static int set_remote_length(struct dosmnt_context *ctx, const char *remote, uint32_t size) {
+    uint8_t payload[4 + DOSMNT_MAX_PATH];
+    uint8_t response[1];
+    uint8_t status = 0;
+    uint16_t resp_len = sizeof(response);
+    uint16_t path_len = (uint16_t)(strlen(remote) + 1);
+    uint16_t payload_len = (uint16_t)(4 + path_len);
+
+    payload[0] = (uint8_t)(size & 0xFF);
+    payload[1] = (uint8_t)((size >> 8) & 0xFF);
+    payload[2] = (uint8_t)((size >> 16) & 0xFF);
+    payload[3] = (uint8_t)((size >> 24) & 0xFF);
+    memcpy(payload + 4, remote, path_len);
+
+    int rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_SETLEN, payload, payload_len,
+                                   &status, response, &resp_len);
+    if (rc != 0) {
+        return rc;
+    }
+    if (status != DOSMNT_STATUS_OK) {
+        return status_to_errno(status);
+    }
+    return 0;
+}
+static int dosmnt_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    (void)mode;
+
+    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path, fi ? fi->flags : O_WRONLY);
+    if (!fh) {
+        return -ENOMEM;
+    }
+
+    int rc = set_remote_length(ctx, fh->remote, 0);
+    if (rc != 0) {
+        free_file_handle(fh);
+        return rc;
+    }
+
+    if (fi) {
+        fi->fh = (uint64_t)(uintptr_t)fh;
+    } else {
+        free_file_handle(fh);
+    }
+    return 0;
+}
+
+static int dosmnt_write(const char *path, const char *buf, size_t size, off_t offset,
+                        struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    char remote[DOSMNT_MAX_PATH];
+    const char *remote_path;
+    uint8_t status;
+    size_t total = 0;
+
+    trace_msg(ctx, "write %s off=%lld size=%zu", path, (long long)offset, size);
+    if (offset < 0 || offset > 0xFFFFFFFFLL) {
+        return -EOVERFLOW;
+    }
+
+    struct dosmnt_file_handle *fh = file_handle_from_fi(fi);
+    if (fh) {
+        remote_path = fh->remote;
+    } else {
+        build_remote_path(ctx, path, remote);
+        remote_path = remote;
+    }
+
+    size_t path_len = strlen(remote_path) + 1;
+    if ((size_t)(6 + path_len) >= DOSMNT_MAX_PAYLOAD) {
+        return -ENAMETOOLONG;
+    }
+
+    while (total < size) {
+        size_t chunk = size - total;
+        size_t max_chunk = DOSMNT_MAX_DATA;
+        size_t max_payload = DOSMNT_MAX_PAYLOAD - (6 + path_len);
+        if (max_payload < max_chunk) {
+            max_chunk = max_payload;
+        }
+        if (max_chunk == 0) {
+            return (total > 0) ? (int)total : -EFBIG;
+        }
+        if (chunk > max_chunk) {
+            chunk = max_chunk;
+        }
+
+        uint8_t payload[6 + DOSMNT_MAX_PATH + DOSMNT_MAX_DATA];
+        uint8_t response[1];
+        uint16_t resp_len = sizeof(response);
+        uint64_t off64 = (uint64_t)offset + total;
+        if (off64 > 0xFFFFFFFFULL) {
+            return (total > 0) ? (int)total : -EOVERFLOW;
+        }
+        uint32_t off = (uint32_t)off64;
+        uint16_t payload_len = (uint16_t)(6 + path_len + chunk);
+
+        payload[0] = (uint8_t)(off & 0xFF);
+        payload[1] = (uint8_t)((off >> 8) & 0xFF);
+        payload[2] = (uint8_t)((off >> 16) & 0xFF);
+        payload[3] = (uint8_t)((off >> 24) & 0xFF);
+        payload[4] = (uint8_t)(chunk & 0xFF);
+        payload[5] = (uint8_t)((chunk >> 8) & 0xFF);
+        memcpy(payload + 6, remote_path, path_len);
+        memcpy(payload + 6 + path_len, buf + total, chunk);
+
+        int rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_WRITE, payload, payload_len,
+                                       &status, response, &resp_len);
+        if (rc != 0) {
+            return (total > 0) ? (int)total : rc;
+        }
+        if (status != DOSMNT_STATUS_OK) {
+            return (total > 0) ? (int)total : status_to_errno(status);
+        }
+
+        total += chunk;
+    }
+
+    return (int)total;
+}
+
+static int dosmnt_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    char remote[DOSMNT_MAX_PATH];
+    const char *remote_path;
+
+    if (size < 0 || size > 0xFFFFFFFFLL) {
+        return -EOVERFLOW;
+    }
+
+    struct dosmnt_file_handle *fh = file_handle_from_fi(fi);
+    if (fh) {
+        remote_path = fh->remote;
+    } else {
+        build_remote_path(ctx, path, remote);
+        remote_path = remote;
+    }
+
+    return set_remote_length(ctx, remote_path, (uint32_t)size);
+}
+
+static int dosmnt_release(const char *path, struct fuse_file_info *fi) {
+    (void)path;
+    struct dosmnt_file_handle *fh = file_handle_from_fi(fi);
+    free_file_handle(fh);
+    if (fi) {
+        fi->fh = 0;
+    }
+    return 0;
+}
+
+static int dosmnt_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    trace_msg(ctx, "chmod %s mode=%o (noop)", path, mode);
+    (void)fi;
+    return 0;
+}
+
+static int dosmnt_chown(const char *path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    trace_msg(ctx, "chown %s uid=%u gid=%u (noop)", path, (unsigned)uid, (unsigned)gid);
+    (void)fi;
+    return 0;
+}
+
+static int dosmnt_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi) {
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
+    (void)tv;
+    (void)fi;
+    trace_msg(ctx, "utimens %s (noop)", path);
+    return 0;
 }

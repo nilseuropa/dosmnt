@@ -21,4 +21,4 @@ The executable lands in `build/DOSSRV.EXE`.
 4. Press `Ctrl+Break` to stop the server if needed.
 
 Once active the program waits for framed commands and serves directory listings,
-stat information, and file reads. It never modifies the DOS filesystem.
+stat information, file reads, writes, and truncation requests from the host.

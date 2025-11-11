@@ -7,11 +7,8 @@ filesystem to a Linux host over a plain RS-232 serial link.
   answers requests via COM1, and proxies them to the DOS file APIs.
 * **Linux host** (`linux/`): a FUSE filesystem that connects to the DOS server,
   translates normal POSIX operations into serialized commands, and mounts the tree
-  at any directory on the host.
-
-The current implementation is intentionally read-only. Extending the protocol to
-handle writes or metadata updates should follow the same framing rules described
-below.
+  at any directory on the host. Reads and writes (including truncation) flow over
+  the same serial link, so you can copy files both from and to the DOS machine.
 
 ## On-the-wire protocol
 
@@ -40,8 +37,12 @@ of their payload for a status code (`0` = success).
 | `0x11` (`LIST`)  | Zero-terminated DOS path                       | status, sequence of directory entry records                      |
 | `0x12` (`STAT`)  | Zero-terminated DOS path                       | status, `struct FileInfo` (attributes, size, timestamps)         |
 | `0x13` (`READ`)  | `uint32_t offset`, `uint16_t length`, path     | status, raw file bytes (length <= 1024)                          |
+| `0x14` (`WRITE`) | `uint32_t offset`, `uint16_t length`, path, raw bytes | status only; data is written verbatim at the requested offset |
+| `0x15` (`SETLEN`)| `uint32_t new_size`, path                      | status only (used for create/truncate)                           |
 | `0x1F` (`BYE`)   | none                                           | status only                                                      |
 
+For `WRITE`, the payload mirrors `READ` with an additional data blob: the path
+is zero-terminated, and the requested byte count immediately follows the string.
 Directory entry records are packed as:
 
 ```

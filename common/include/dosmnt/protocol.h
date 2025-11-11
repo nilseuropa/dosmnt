@@ -9,12 +9,15 @@
 #define DOSMNT_MAX_PAYLOAD 2048
 #define DOSMNT_MAX_PATH    144
 #define DOSMNT_MAX_DATA    1024
+#define DOSMNT_FLAG_READONLY 0x0001
 
 enum dosmnt_opcode {
     DOSMNT_OP_HELLO = 0x10,
     DOSMNT_OP_LIST  = 0x11,
     DOSMNT_OP_STAT  = 0x12,
     DOSMNT_OP_READ  = 0x13,
+    DOSMNT_OP_WRITE = 0x14,
+    DOSMNT_OP_SETLEN = 0x15,
     DOSMNT_OP_BYE   = 0x1F
 };
 

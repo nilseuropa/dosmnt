@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "dos_serial.h"
 #include "dosmnt/protocol.h"
@@ -30,6 +31,12 @@ static FILE *g_active_file = NULL;
 static char g_active_path[DOSMNT_MAX_PATH];
 static struct dosmnt_frame g_frame;
 static uint8_t g_response_buffer[DOSMNT_MAX_PAYLOAD];
+enum active_mode {
+    ACTIVE_MODE_NONE = 0,
+    ACTIVE_MODE_READ,
+    ACTIVE_MODE_WRITE
+};
+static enum active_mode g_active_mode = ACTIVE_MODE_NONE;
 
 #define TRACE_LOG_NAME "DOSSRV.LOG"
 static int g_trace = 0;
@@ -236,7 +243,7 @@ static uint32_t pack_dos_timestamp(uint16_t date, uint16_t time) {
 }
 
 static uint8_t read_path_string(const uint8_t *payload, uint16_t length, uint16_t offset,
-                                char *out_path) {
+                                char *out_path, uint16_t *consumed) {
     uint16_t max_len;
     uint16_t i;
     const uint8_t *src;
@@ -270,6 +277,10 @@ static uint8_t read_path_string(const uint8_t *payload, uint16_t length, uint16_
 
     if (out_path[0] == '\0') {
         strcpy(out_path, ".\\");
+    }
+
+    if (consumed != NULL) {
+        *consumed = (uint16_t)(i + 1);
     }
 
     return DOSMNT_STATUS_OK;
@@ -377,7 +388,7 @@ static void process_hello(const struct dosmnt_frame *frame) {
 
     payload[0] = DOSMNT_STATUS_OK;
     payload[1] = 1; /* protocol version */
-    payload[2] = 0x01; /* read-only flag LSB */
+    payload[2] = 0x00; /* filesystem is writable */
     payload[3] = 0x00;
     memset(payload + 4, 0, 32);
 
@@ -404,7 +415,7 @@ static void process_list(const struct dosmnt_frame *frame) {
     uint16_t offset = 0;
     uint8_t status;
 
-    status = read_path_string(frame->payload, frame->length, 0, path);
+    status = read_path_string(frame->payload, frame->length, 0, path, NULL);
     if (status != DOSMNT_STATUS_OK) {
         send_status(frame->opcode, frame->seq, status, NULL, 0);
         return;
@@ -458,7 +469,7 @@ static void process_stat(const struct dosmnt_frame *frame) {
     struct dosmnt_stat st;
     uint8_t status;
 
-    status = read_path_string(frame->payload, frame->length, 0, path);
+    status = read_path_string(frame->payload, frame->length, 0, path, NULL);
     if (status != DOSMNT_STATUS_OK) {
         send_status(frame->opcode, frame->seq, status, NULL, 0);
         return;
@@ -499,7 +510,7 @@ static void process_read(const struct dosmnt_frame *frame) {
         return;
     }
 
-    status = read_path_string(frame->payload, frame->length, 6, path);
+    status = read_path_string(frame->payload, frame->length, 6, path, NULL);
     if (status != DOSMNT_STATUS_OK) {
         send_status(frame->opcode, frame->seq, status, NULL, 0);
         return;
@@ -511,7 +522,8 @@ static void process_read(const struct dosmnt_frame *frame) {
            path, offset, (unsigned)chunk_len);
 
     if (offset == 0 || g_active_file == NULL ||
-        strcmp(g_active_path, path) != 0) {
+        strcmp(g_active_path, path) != 0 ||
+        g_active_mode != ACTIVE_MODE_READ) {
         reset_active_file();
         g_active_file = fopen(path, "rb");
         if (g_active_file == NULL) {
@@ -521,6 +533,7 @@ static void process_read(const struct dosmnt_frame *frame) {
         }
         strncpy(g_active_path, path, sizeof(g_active_path) - 1);
         g_active_path[sizeof(g_active_path) - 1] = '\0';
+        g_active_mode = ACTIVE_MODE_READ;
     }
 
     if (fseek(g_active_file, (long)offset, SEEK_SET) != 0) {
@@ -533,6 +546,143 @@ static void process_read(const struct dosmnt_frame *frame) {
 
     bytes_read = fread(buffer, 1, chunk_len, g_active_file);
     send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, buffer, (uint16_t)bytes_read);
+}
+
+static uint8_t resize_file(const char *path, uint32_t new_size) {
+    int fd;
+
+    fd = _open(path, O_BINARY | O_RDWR);
+    if (fd < 0) {
+        fd = _open(path, O_BINARY | O_RDWR | O_CREAT | O_TRUNC, S_IWRITE | S_IREAD);
+        if (fd < 0) {
+            return (errno == ENOENT) ? DOSMNT_STATUS_NOT_FOUND : DOSMNT_STATUS_IO_ERROR;
+        }
+    }
+
+    if (chsize(fd, (long)new_size) != 0) {
+        _close(fd);
+        return DOSMNT_STATUS_IO_ERROR;
+    }
+
+    _close(fd);
+
+    if (g_active_file != NULL && strcmp(g_active_path, path) == 0) {
+        reset_active_file();
+    }
+
+    return DOSMNT_STATUS_OK;
+}
+
+static void process_write(const struct dosmnt_frame *frame) {
+    uint32_t offset;
+    uint16_t chunk_len;
+    uint16_t path_bytes;
+    uint16_t data_offset;
+    const uint8_t *data_ptr;
+    char path[DOSMNT_MAX_PATH];
+    uint8_t status;
+    size_t written;
+
+    if (frame->length < 6) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
+        return;
+    }
+
+    offset = (uint32_t)frame->payload[0] |
+             ((uint32_t)frame->payload[1] << 8) |
+             ((uint32_t)frame->payload[2] << 16) |
+             ((uint32_t)frame->payload[3] << 24);
+    chunk_len = (uint16_t)frame->payload[4] | ((uint16_t)frame->payload[5] << 8);
+
+    if (chunk_len > DOSMNT_MAX_DATA) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_NO_SPACE, NULL, 0);
+        return;
+    }
+
+    status = read_path_string(frame->payload, frame->length, 6, path, &path_bytes);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    data_offset = (uint16_t)(6 + path_bytes);
+    if ((uint32_t)data_offset + chunk_len > frame->length) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
+        return;
+    }
+
+    data_ptr = frame->payload + data_offset;
+
+    tracef("[dosmnt] WRITE path=%s offset=%lu len=%u\r\n",
+           path, offset, (unsigned)chunk_len);
+
+    if (chunk_len == 0) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
+        return;
+    }
+
+    if (g_active_file == NULL ||
+        strcmp(g_active_path, path) != 0 ||
+        g_active_mode != ACTIVE_MODE_WRITE) {
+        reset_active_file();
+        g_active_file = fopen(path, "rb+");
+        if (g_active_file == NULL) {
+            g_active_file = fopen(path, "wb+");
+        }
+        if (g_active_file == NULL) {
+            tracef("[dosmnt] fopen (write) failed errno=%d path=%s\r\n", errno, path);
+            send_status(frame->opcode, frame->seq, DOSMNT_STATUS_NOT_FOUND, NULL, 0);
+            return;
+        }
+        strncpy(g_active_path, path, sizeof(g_active_path) - 1);
+        g_active_path[sizeof(g_active_path) - 1] = '\0';
+        g_active_mode = ACTIVE_MODE_WRITE;
+    }
+
+    if (fseek(g_active_file, (long)offset, SEEK_SET) != 0) {
+        tracef("[dosmnt] fseek (write) failed errno=%d path=%s offset=%lu\r\n",
+               errno, path, offset);
+        reset_active_file();
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_IO_ERROR, NULL, 0);
+        return;
+    }
+
+    written = fwrite(data_ptr, 1, chunk_len, g_active_file);
+    if (written != chunk_len) {
+        tracef("[dosmnt] fwrite failed errno=%d path=%s len=%u wrote=%lu\r\n",
+               errno, path, (unsigned)chunk_len, (unsigned long)written);
+        reset_active_file();
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_IO_ERROR, NULL, 0);
+        return;
+    }
+
+    fflush(g_active_file);
+    send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
+}
+
+static void process_setlen(const struct dosmnt_frame *frame) {
+    char path[DOSMNT_MAX_PATH];
+    uint32_t new_size;
+    uint8_t status;
+
+    if (frame->length < 4) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
+        return;
+    }
+
+    new_size = (uint32_t)frame->payload[0] |
+               ((uint32_t)frame->payload[1] << 8) |
+               ((uint32_t)frame->payload[2] << 16) |
+               ((uint32_t)frame->payload[3] << 24);
+
+    status = read_path_string(frame->payload, frame->length, 4, path, NULL);
+    if (status != DOSMNT_STATUS_OK) {
+        send_status(frame->opcode, frame->seq, status, NULL, 0);
+        return;
+    }
+
+    status = resize_file(path, new_size);
+    send_status(frame->opcode, frame->seq, status, NULL, 0);
 }
 
 static void process_frame(const struct dosmnt_frame *frame) {
@@ -548,6 +698,12 @@ static void process_frame(const struct dosmnt_frame *frame) {
             break;
         case DOSMNT_OP_READ:
             process_read(frame);
+            break;
+        case DOSMNT_OP_WRITE:
+            process_write(frame);
+            break;
+        case DOSMNT_OP_SETLEN:
+            process_setlen(frame);
             break;
         case DOSMNT_OP_BYE:
             reset_active_file();
@@ -589,4 +745,5 @@ static void reset_active_file(void) {
         g_active_file = NULL;
         g_active_path[0] = '\0';
     }
+    g_active_mode = ACTIVE_MODE_NONE;
 }
