@@ -28,6 +28,8 @@ static volatile int g_keep_running = 1;
 static FILE *g_trace_file = NULL;
 static FILE *g_active_file = NULL;
 static char g_active_path[DOSMNT_MAX_PATH];
+static struct dosmnt_frame g_frame;
+static uint8_t g_response_buffer[DOSMNT_MAX_PAYLOAD];
 
 #define TRACE_LOG_NAME "DOSSRV.LOG"
 static int g_trace = 0;
@@ -206,20 +208,24 @@ static int read_frame(struct dosmnt_frame *frame) {
 
 static void send_status(uint8_t opcode, uint8_t seq, uint8_t status,
                         const uint8_t *data, uint16_t data_len) {
-    uint8_t buffer[DOSMNT_MAX_PAYLOAD];
+    uint8_t *payload = g_response_buffer;
+
+    if (data == NULL) {
+        data_len = 0;
+    }
 
     if (data_len + 1 > DOSMNT_MAX_PAYLOAD) {
         data_len = DOSMNT_MAX_PAYLOAD - 1;
     }
 
-    buffer[0] = status;
-    if (data_len > 0 && data != NULL) {
-        memcpy(buffer + 1, data, data_len);
+    if (data_len > 0 && data != payload + 1) {
+        memcpy(payload + 1, data, data_len);
     }
 
     tracef("[dosmnt] TX opcode=0x%02X len=%u status=0x%02X\r\n",
            dosmnt_response_opcode(opcode), data_len + 1, status);
-    serial_send_frame(dosmnt_response_opcode(opcode), seq, buffer, data_len + 1);
+    payload[0] = status;
+    serial_send_frame(dosmnt_response_opcode(opcode), seq, payload, data_len + 1);
 }
 
 static void normalize_path(char *path);
@@ -394,8 +400,8 @@ static void process_list(const struct dosmnt_frame *frame) {
     struct find_t info;
     unsigned attr_mask = _A_SUBDIR | _A_NORMAL | _A_RDONLY |
                          _A_HIDDEN | _A_SYSTEM | _A_ARCH;
-    uint8_t buffer[DOSMNT_MAX_PAYLOAD];
-    uint16_t offset = 1;
+    uint8_t *buffer = g_response_buffer + 1;
+    uint16_t offset = 0;
     uint8_t status;
 
     status = read_path_string(frame->payload, frame->length, 0, path);
@@ -412,8 +418,6 @@ static void process_list(const struct dosmnt_frame *frame) {
         send_status(frame->opcode, frame->seq, DOSMNT_STATUS_NOT_FOUND, NULL, 0);
         return;
     }
-
-    buffer[0] = DOSMNT_STATUS_OK;
 
     do {
         struct dosmnt_dirent entry;
@@ -435,18 +439,18 @@ static void process_list(const struct dosmnt_frame *frame) {
         entry.name_len = name_len;
 
         needed = sizeof(entry) + name_len;
-        if ((offset + needed) > DOSMNT_MAX_PAYLOAD) {
+        if ((offset + needed) > (DOSMNT_MAX_PAYLOAD - 1)) {
             send_status(frame->opcode, frame->seq, DOSMNT_STATUS_TOO_LARGE, NULL, 0);
             return;
         }
 
         memcpy(buffer + offset, &entry, sizeof(entry));
-        offset += sizeof(entry);
+        offset += (uint16_t)sizeof(entry);
         memcpy(buffer + offset, info.name, name_len);
         offset += name_len;
     } while (_dos_findnext(&info) == 0);
 
-    serial_send_frame(dosmnt_response_opcode(frame->opcode), frame->seq, buffer, offset);
+    send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, buffer, offset);
 }
 
 static void process_stat(const struct dosmnt_frame *frame) {
@@ -476,7 +480,7 @@ static void process_read(const struct dosmnt_frame *frame) {
     uint16_t chunk_len;
     char path[DOSMNT_MAX_PATH];
     uint8_t status;
-    uint8_t buffer[DOSMNT_MAX_PAYLOAD];
+    uint8_t *buffer = g_response_buffer + 1;
     size_t bytes_read;
 
     if (frame->length < 6) {
@@ -557,8 +561,6 @@ static void process_frame(const struct dosmnt_frame *frame) {
 }
 
 int main(void) {
-    struct dosmnt_frame frame;
-
     init_trace_log();
 
     printf("DOSMNT resident server starting (Ctrl+Break to exit)\r\n");
@@ -570,10 +572,10 @@ int main(void) {
     serial_init(SERIAL_DEFAULT_PORT, SERIAL_DEFAULT_BAUD);
 
     while (g_keep_running) {
-        if (!read_frame(&frame)) {
+        if (!read_frame(&g_frame)) {
             continue;
         }
-        process_frame(&frame);
+        process_frame(&g_frame);
     }
 
     printf("\r\nDOSMNT server stopped.\r\n");
