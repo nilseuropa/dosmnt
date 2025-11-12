@@ -70,6 +70,8 @@ wmake
 
 The resulting `DOSSRV.EXE` should be copied to the DOS machine. Loading it from
 `AUTOEXEC.BAT` keeps it resident for the whole session.
+At runtime you can point it at a different serial port or speed with
+`-C COMx` and `-B baud` (for example, `DOSSRV -CCOM2 -B57600`).
 
 ### Linux side
 
@@ -80,7 +82,7 @@ equivalent for your distribution) is installed, then:
 cd linux
 cmake -S . -B build
 cmake --build build
-sudo build/dosmnt --device /dev/ttyUSB0 --mount /mnt/dos
+sudo build/dosmnt --device /dev/ttyUSB0 --mount /mnt/dos --baud 115200
 ```
 
 Unmount with `fusermount3 -u /mnt/dos` when done.

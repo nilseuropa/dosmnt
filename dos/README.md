@@ -20,6 +20,14 @@ The executable lands in `build/DOSSRV.EXE`.
    filesystem is mounted on the host.
 4. Press `Ctrl+Break` to stop the server if needed.
 
+`DOSSRV.EXE` accepts two optional switches to match your hardware:
+
+* `-C COMx` – pick `COM1`-`COM4` (defaults to `COM1` / 0x3F8).
+* `-B baud` – override the serial speed (defaults to `115200`).
+
+You can also stick the value right after the flag (`-B57600`, `-CCOM2`) if you
+prefer DOS-style concatenated switches.
+
 Once active the program waits for framed commands and serves directory listings,
 stat information, file reads/writes, truncation, and directory/file maintenance
 requests (mkdir, rmdir, delete) from the host.

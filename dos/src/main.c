@@ -18,6 +18,7 @@
 
 #define SERIAL_DEFAULT_PORT 0x3F8
 #define SERIAL_DEFAULT_BAUD 115200UL
+#define COM_MAX 4
 
 struct dosmnt_frame {
     uint8_t opcode;
@@ -32,6 +33,8 @@ static FILE *g_active_file = NULL;
 static char g_active_path[DOSMNT_MAX_PATH];
 static struct dosmnt_frame g_frame;
 static uint8_t g_response_buffer[DOSMNT_MAX_PAYLOAD];
+static uint16_t g_serial_port = SERIAL_DEFAULT_PORT;
+static uint32_t g_serial_baud = SERIAL_DEFAULT_BAUD;
 enum active_mode {
     ACTIVE_MODE_NONE = 0,
     ACTIVE_MODE_READ,
@@ -47,6 +50,10 @@ static void log_line(const char *text);
 static void init_trace_log(void);
 static void close_trace_log(void);
 static void reset_active_file(void);
+static int parse_command_line(int argc, char **argv);
+static int parse_com_port(const char *value, uint16_t *out);
+static int parse_baud(const char *value, uint32_t *out);
+static void print_usage(const char *prog_name);
 
 static void tracef(const char *fmt, ...) {
     va_list ap;
@@ -857,7 +864,11 @@ static void process_frame(const struct dosmnt_frame *frame) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (!parse_command_line(argc, argv)) {
+        return 1;
+    }
+
     init_trace_log();
 
     printf("DOSMNT resident server starting (Ctrl+Break to exit)\r\n");
@@ -866,7 +877,7 @@ int main(void) {
         printf("Trace log file: %s\r\n", TRACE_LOG_NAME);
     }
 
-    serial_init(SERIAL_DEFAULT_PORT, SERIAL_DEFAULT_BAUD);
+    serial_init(g_serial_port, g_serial_baud);
 
     while (g_keep_running) {
         if (!read_frame(&g_frame)) {
@@ -887,4 +898,123 @@ static void reset_active_file(void) {
         g_active_path[0] = '\0';
     }
     g_active_mode = ACTIVE_MODE_NONE;
+}
+
+static int parse_command_line(int argc, char **argv) {
+    int i;
+
+    g_serial_port = SERIAL_DEFAULT_PORT;
+    g_serial_baud = SERIAL_DEFAULT_BAUD;
+
+    for (i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        const char *value;
+        char option;
+
+        if (arg == NULL || arg[0] == '\0') {
+            continue;
+        }
+        if (arg[0] != '-' && arg[0] != '/') {
+            printf("Unknown argument: %s\r\n", arg);
+            print_usage(argv[0]);
+            return 0;
+        }
+
+        option = (char)toupper((unsigned char)arg[1]);
+        if (option == '?' || option == 'H') {
+            print_usage(argv[0]);
+            return 0;
+        }
+
+        if (arg[2] != '\0') {
+            value = &arg[2];
+        } else {
+            if (i + 1 >= argc) {
+                printf("Missing value for -%c\r\n", option);
+                print_usage(argv[0]);
+                return 0;
+            }
+            value = argv[++i];
+        }
+
+        switch (option) {
+            case 'B':
+                if (!parse_baud(value, &g_serial_baud)) {
+                    printf("Invalid baud rate: %s\r\n", value);
+                    print_usage(argv[0]);
+                    return 0;
+                }
+                break;
+            case 'C':
+                if (!parse_com_port(value, &g_serial_port)) {
+                    printf("Invalid COM port: %s\r\n", value);
+                    print_usage(argv[0]);
+                    return 0;
+                }
+                break;
+            default:
+                printf("Unknown option: %s\r\n", arg);
+                print_usage(argv[0]);
+                return 0;
+        }
+    }
+
+    printf("Serial settings: port 0x%X (%lu baud)\r\n",
+           g_serial_port, (unsigned long)g_serial_baud);
+    return 1;
+}
+
+static int parse_baud(const char *value, uint32_t *out) {
+    char *end = NULL;
+    unsigned long rate;
+
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    rate = strtoul(value, &end, 10);
+    if (end == NULL || *end != '\0' || rate == 0UL) {
+        return 0;
+    }
+
+    *out = (uint32_t)rate;
+    return 1;
+}
+
+static int parse_com_port(const char *value, uint16_t *out) {
+    static const uint16_t com_map[COM_MAX + 1] = {
+        0, 0x3F8, 0x2F8, 0x3E8, 0x2E8
+    };
+    const char *digits = value;
+    char *end = NULL;
+    long number;
+
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    if ((value[0] == 'C' || value[0] == 'c') &&
+        (value[1] == 'O' || value[1] == 'o') &&
+        (value[2] == 'M' || value[2] == 'm')) {
+        digits = &value[3];
+    }
+
+    number = strtol(digits, &end, 10);
+    if (end == NULL || *end != '\0') {
+        return 0;
+    }
+
+    if (number < 1 || number > COM_MAX) {
+        return 0;
+    }
+
+    *out = com_map[number];
+    return 1;
+}
+
+static void print_usage(const char *prog_name) {
+    const char *name = (prog_name != NULL && prog_name[0] != '\0') ? prog_name : "DOSSRV";
+    printf("Usage: %s [-B baud] [-C COMx]\r\n", name);
+    printf("  -B baud   Serial speed in bits per second (default %lu)\r\n", (unsigned long)SERIAL_DEFAULT_BAUD);
+    printf("  -C COMx   Serial port (COM1-COM4)\r\n");
 }

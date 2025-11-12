@@ -157,7 +157,7 @@ static void usage(const char *prog) {
             "Usage: %s [options] --mount PATH [-- FUSE options]\n"
             "  --device PATH       Serial TTY (default /dev/ttyS0)\n"
             "  --mount PATH        Mount point (required)\n"
-            "  --baud RATE         Baud rate (default 115200)\n"
+            "  --baud RATE         Baud rate (default 115200) [alias: -B]\n"
             "  --drive LETTER      DOS drive letter to pin requests\n"
             "  --debug             Enable verbose tracing\n"
             "Example: %s --device /dev/ttyUSB0 --mount /mnt/dos --drive C -- -f -o allow_other\n",
@@ -186,7 +186,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
     }
     args[idx++] = strdup(argv[0]);
 
-    while ((opt = getopt_long(argc, argv, "d:m:b:r:gh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:m:b:B:r:gh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 out->device = optarg;
@@ -195,6 +195,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
                 out->mountpoint = optarg;
                 break;
             case 'b':
+            case 'B':
                 out->baud = atoi(optarg);
                 break;
             case 'r':
