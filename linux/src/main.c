@@ -37,6 +37,8 @@ struct dosmnt_context {
 struct dosmnt_file_handle {
     char remote[DOSMNT_MAX_PATH];
     int flags;
+    uint64_t size;
+    int dirty;
 };
 
 static int parse_options(int argc, char **argv, struct cli_options *out,
@@ -48,7 +50,8 @@ static time_t dos_time_to_unix(uint32_t packed);
 static int status_to_errno(uint8_t status);
 static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...);
 static struct dosmnt_file_handle *alloc_file_handle(const struct dosmnt_context *ctx,
-                                                    const char *path, int flags);
+                                                    const char *path, int flags,
+                                                    uint64_t initial_size);
 static void free_file_handle(struct dosmnt_file_handle *fh);
 static struct dosmnt_file_handle *file_handle_from_fi(struct fuse_file_info *fi);
 static int set_remote_length(struct dosmnt_context *ctx, const char *remote, uint32_t size);
@@ -486,7 +489,8 @@ static int dosmnt_open(const char *path, struct fuse_file_info *fi) {
         return 0;
     }
 
-    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path, fi->flags);
+    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path, fi->flags,
+                                                      (uint64_t)st.st_size);
     if (!fh) {
         return -ENOMEM;
     }
@@ -602,13 +606,16 @@ static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...) {
     fputc('\n', stderr);
 }
 static struct dosmnt_file_handle *alloc_file_handle(const struct dosmnt_context *ctx,
-                                                    const char *path, int flags) {
+                                                    const char *path, int flags,
+                                                    uint64_t initial_size) {
     struct dosmnt_file_handle *fh = calloc(1, sizeof(*fh));
     if (!fh) {
         return NULL;
     }
     build_remote_path(ctx, path, fh->remote);
     fh->flags = flags;
+    fh->size = initial_size;
+    fh->dirty = 0;
     return fh;
 }
 
@@ -676,7 +683,8 @@ static int dosmnt_create(const char *path, mode_t mode, struct fuse_file_info *f
     struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
     (void)mode;
 
-    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path, fi ? fi->flags : O_WRONLY);
+    struct dosmnt_file_handle *fh = alloc_file_handle(ctx, path,
+                                                      fi ? fi->flags : O_WRONLY, 0);
     if (!fh) {
         return -ENOMEM;
     }
@@ -763,6 +771,14 @@ static int dosmnt_write(const char *path, const char *buf, size_t size, off_t of
             return (total > 0) ? (int)total : status_to_errno(status);
         }
 
+        if (fh) {
+            uint64_t end_pos = (uint64_t)off + chunk;
+            if (end_pos > fh->size) {
+                fh->size = end_pos;
+            }
+            fh->dirty = 1;
+        }
+
         total += chunk;
     }
 
@@ -786,17 +802,34 @@ static int dosmnt_truncate(const char *path, off_t size, struct fuse_file_info *
         remote_path = remote;
     }
 
-    return set_remote_length(ctx, remote_path, (uint32_t)size);
+    int rc = set_remote_length(ctx, remote_path, (uint32_t)size);
+    if (rc == 0 && fh) {
+        fh->size = (uint64_t)size;
+        fh->dirty = 0;
+    }
+    return rc;
 }
 
 static int dosmnt_release(const char *path, struct fuse_file_info *fi) {
-    (void)path;
+    struct dosmnt_context *ctx = (struct dosmnt_context *)fuse_get_context()->private_data;
     struct dosmnt_file_handle *fh = file_handle_from_fi(fi);
+    int rc = 0;
+
+    (void)path;
+
+    if (fh && fh->dirty) {
+        if (fh->size > UINT32_MAX) {
+            rc = -EFBIG;
+        } else {
+            rc = set_remote_length(ctx, fh->remote, (uint32_t)fh->size);
+        }
+    }
+
     free_file_handle(fh);
     if (fi) {
         fi->fh = 0;
     }
-    return 0;
+    return rc;
 }
 
 static int dosmnt_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
