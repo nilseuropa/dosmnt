@@ -3,6 +3,8 @@
 This project provides a minimal two-part setup that exposes a DOS machine's
 filesystem to a Linux host over a plain RS-232 serial link.
 
+![](doc/sh.png)
+
 * **DOS resident** (`dos/`): a tiny server that stays running on the DOS side,
   answers requests via COM1, and proxies them to the DOS file APIs.
 * **Linux host** (`linux/`): a FUSE filesystem that connects to the DOS server,
