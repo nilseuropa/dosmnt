@@ -25,6 +25,7 @@ struct cli_options {
     int baud;
     char drive;
     int debug;
+    int verbose;
 };
 
 struct dosmnt_context {
@@ -32,6 +33,7 @@ struct dosmnt_context {
     char drive_prefix[3];
     char volume_label[33];
     int debug;
+    int verbose;
 };
 
 struct dosmnt_file_handle {
@@ -101,7 +103,8 @@ int main(int argc, char **argv) {
         .mountpoint = NULL,
         .baud = 115200,
         .drive = 0,
-        .debug = 0
+        .debug = 0,
+        .verbose = 0
     };
     struct dosmnt_context ctx;
     int fuse_argc = 0;
@@ -120,6 +123,7 @@ int main(int argc, char **argv) {
         ctx.drive_prefix[2] = '\0';
     }
     ctx.debug = opts.debug;
+    ctx.verbose = opts.verbose;
 
     rc = dosmnt_client_open(&ctx.client, opts.device, opts.baud);
     if (rc != 0) {
@@ -137,6 +141,9 @@ int main(int argc, char **argv) {
     }
 
     printf("Connected to DOS volume '%s'\n", ctx.volume_label);
+    if (ctx.verbose) {
+        fprintf(stderr, "[dosmnt] verbose logging enabled\n");
+    }
     if (ctx.debug) {
         fprintf(stderr, "[dosmnt] debug trace enabled\n");
     }
@@ -159,6 +166,7 @@ static void usage(const char *prog) {
             "  --mount PATH        Mount point (required)\n"
             "  --baud RATE         Baud rate (default 115200) [alias: -B]\n"
             "  --drive LETTER      DOS drive letter to pin requests\n"
+            "  --verbose           Print filesystem activity to stderr [alias: -v]\n"
             "  --debug             Enable verbose tracing\n"
             "Example: %s --device /dev/ttyUSB0 --mount /mnt/dos --drive C -- -f -o allow_other\n",
             prog, prog);
@@ -171,6 +179,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
         {"mount", required_argument, 0, 'm'},
         {"baud", required_argument, 0, 'b'},
         {"drive", required_argument, 0, 'r'},
+        {"verbose", no_argument, 0, 'v'},
         {"debug", no_argument, 0, 'g'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -186,7 +195,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
     }
     args[idx++] = strdup(argv[0]);
 
-    while ((opt = getopt_long(argc, argv, "d:m:b:B:r:gh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:m:b:B:r:vgh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 out->device = optarg;
@@ -200,6 +209,9 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
                 break;
             case 'r':
                 out->drive = optarg[0];
+                break;
+            case 'v':
+                out->verbose = 1;
                 break;
             case 'g':
                 out->debug = 1;
@@ -597,7 +609,7 @@ static int dosmnt_statfs(const char *path, struct statvfs *stbuf) {
 
 static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...) {
     va_list ap;
-    if (!ctx || !ctx->debug) {
+    if (!ctx || (!ctx->verbose && !ctx->debug)) {
         return;
     }
     fprintf(stderr, "[dosmnt] ");
