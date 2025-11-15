@@ -83,6 +83,7 @@ static int dosmnt_mkdir(const char *path, mode_t mode);
 static int dosmnt_rmdir(const char *path);
 static int send_simple_path(struct dosmnt_context *ctx, uint8_t opcode, const char *remote);
 static int dosmnt_statfs(const char *path, struct statvfs *stbuf);
+static void send_bye(struct dosmnt_context *ctx);
 
 static const struct fuse_operations dosmnt_ops = {
     .getattr = dosmnt_getattr,
@@ -161,6 +162,7 @@ int main(int argc, char **argv) {
     }
 
     rc = fuse_main(fuse_argc, fuse_argv, &dosmnt_ops, &ctx);
+    send_bye(&ctx);
     if (fuse_argv) {
         for (int i = 0; i < fuse_argc; ++i) {
             free(fuse_argv[i]);
@@ -660,6 +662,19 @@ static int dosmnt_statfs(const char *path, struct statvfs *stbuf) {
     stbuf->f_flag = ST_NOSUID;
     stbuf->f_namemax = 12;
     return 0;
+}
+
+static void send_bye(struct dosmnt_context *ctx) {
+    uint8_t status = 0;
+    uint8_t response[1];
+    uint16_t resp_len = sizeof(response);
+    if (!ctx || ctx->client.fd <= 0) {
+        return;
+    }
+    if (dosmnt_client_request(&ctx->client, DOSMNT_OP_BYE, NULL, 0,
+                              &status, response, &resp_len) == 0) {
+        trace_msg(ctx, "sent BYE status=0x%02X", status);
+    }
 }
 
 static void trace_msg(const struct dosmnt_context *ctx, const char *fmt, ...) {
