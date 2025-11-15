@@ -4,12 +4,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
 
 #define SERIAL_DEFAULT_FLAGS (CLOCAL | CREAD | CS8)
+#define SERIAL_READ_TIMEOUT_MS 5000
 
 static int configure_serial(int fd, int baud);
 static speed_t baud_to_flag(int baud);
@@ -17,7 +19,8 @@ static uint8_t compute_checksum(uint8_t opcode, uint8_t seq, uint16_t length, co
 static int write_all(int fd, const uint8_t *buf, size_t len);
 static int read_byte(int fd, uint8_t *byte);
 static int read_frame_payload(int fd, uint8_t expected_opcode, uint8_t expected_seq,
-                              uint8_t *status, uint8_t *reply_buf, uint16_t *reply_len);
+                              uint8_t *status, uint8_t *reply_buf, uint16_t reply_capacity,
+                              uint16_t *reply_len);
 static void tracef(const struct dosmnt_client *client, const char *label,
                    uint8_t opcode, uint16_t length);
 
@@ -68,10 +71,19 @@ int dosmnt_client_request(struct dosmnt_client *client,
                           uint16_t *reply_len) {
     uint8_t header[6];
     uint8_t seq;
+    uint16_t reply_capacity = 0;
     int rc;
 
     if (payload_len > DOSMNT_MAX_PAYLOAD) {
         return -EMSGSIZE;
+    }
+
+    if (reply_buf != NULL && reply_len == NULL) {
+        return -EINVAL;
+    }
+
+    if (reply_buf != NULL && reply_len != NULL) {
+        reply_capacity = *reply_len;
     }
 
     pthread_mutex_lock(&client->lock);
@@ -113,7 +125,7 @@ int dosmnt_client_request(struct dosmnt_client *client,
 
     tracef(client, "TX", opcode, payload_len);
     rc = read_frame_payload(client->fd, dosmnt_response_opcode(opcode), seq,
-                            status, reply_buf, reply_len);
+                            status, reply_buf, reply_capacity, reply_len);
 
     pthread_mutex_unlock(&client->lock);
 
@@ -191,7 +203,30 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
 }
 
 static int read_byte(int fd, uint8_t *byte) {
+    struct pollfd pfd;
+    int pret;
     ssize_t ret;
+
+    for (;;) {
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pret = poll(&pfd, 1, SERIAL_READ_TIMEOUT_MS);
+        if (pret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -errno;
+        }
+        if (pret == 0) {
+            return -ETIMEDOUT;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return -EIO;
+        }
+        if (pfd.revents & POLLIN) {
+            break;
+        }
+    }
 
     do {
         ret = read(fd, byte, 1);
@@ -205,12 +240,14 @@ static int read_byte(int fd, uint8_t *byte) {
 }
 
 static int read_frame_payload(int fd, uint8_t expected_opcode, uint8_t expected_seq,
-                              uint8_t *status, uint8_t *reply_buf, uint16_t *reply_len) {
+                              uint8_t *status, uint8_t *reply_buf, uint16_t reply_capacity,
+                              uint16_t *reply_len) {
     uint8_t header_byte;
     uint8_t opcode = 0;
     uint8_t seq = 0;
     uint16_t length = 0;
     uint8_t checksum;
+    uint8_t frame_buf[DOSMNT_MAX_PAYLOAD];
     int rc;
     uint16_t i;
 
@@ -265,7 +302,7 @@ static int read_frame_payload(int fd, uint8_t expected_opcode, uint8_t expected_
         }
 
         for (i = 0; i < length; ++i) {
-            rc = read_byte(fd, &reply_buf[i]);
+            rc = read_byte(fd, &frame_buf[i]);
             if (rc != 0) {
                 return rc;
             }
@@ -276,7 +313,7 @@ static int read_frame_payload(int fd, uint8_t expected_opcode, uint8_t expected_
             return rc;
         }
 
-        if (checksum != compute_checksum(opcode, seq, length, reply_buf)) {
+        if (checksum != compute_checksum(opcode, seq, length, frame_buf)) {
             continue;
         }
 
@@ -285,14 +322,23 @@ static int read_frame_payload(int fd, uint8_t expected_opcode, uint8_t expected_
             continue;
         }
 
+        if (reply_buf != NULL && length > reply_capacity) {
+            if (reply_len != NULL) {
+                *reply_len = length;
+            }
+            return -EMSGSIZE;
+        }
+
+        if (reply_buf != NULL && length > 0) {
+            memcpy(reply_buf, frame_buf, length);
+        }
+
         if (reply_len != NULL) {
             *reply_len = length;
         }
 
-        if (length == 0) {
-            *status = DOSMNT_STATUS_INTERNAL;
-        } else {
-            *status = reply_buf[0];
+        if (status != NULL) {
+            *status = (length == 0) ? DOSMNT_STATUS_INTERNAL : frame_buf[0];
         }
         return 0;
     }

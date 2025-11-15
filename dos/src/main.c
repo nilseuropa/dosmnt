@@ -41,6 +41,7 @@ enum active_mode {
     ACTIVE_MODE_WRITE
 };
 static enum active_mode g_active_mode = ACTIVE_MODE_NONE;
+static uint32_t g_active_size = 0;
 
 #define TRACE_LOG_NAME "DOSSRV.LOG"
 static int g_trace = 0;
@@ -50,6 +51,7 @@ static void log_line(const char *text);
 static void init_trace_log(void);
 static void close_trace_log(void);
 static void reset_active_file(void);
+static uint32_t get_file_size(FILE *fp);
 static int parse_command_line(int argc, char **argv);
 static int parse_com_port(const char *value, uint16_t *out);
 static int parse_baud(const char *value, uint32_t *out);
@@ -338,6 +340,27 @@ static int is_current_directory(const char *path) {
     return path != NULL && strcmp(path, ".\\") == 0;
 }
 
+static uint32_t get_file_size(FILE *fp) {
+    int handle;
+    long len;
+
+    if (fp == NULL) {
+        return 0;
+    }
+
+    handle = _fileno(fp);
+    if (handle < 0) {
+        return 0;
+    }
+
+    len = _filelength(handle);
+    if (len < 0) {
+        return 0;
+    }
+
+    return (uint32_t)len;
+}
+
 static void make_directory_pattern(const char *input, char *pattern) {
     size_t len;
 
@@ -386,6 +409,14 @@ static uint8_t handle_stat(char *path, struct dosmnt_stat *out_stat) {
 
     out_stat->attributes = info.attrib;
     out_stat->size = info.size;
+
+    if (g_active_file != NULL &&
+        g_active_mode == ACTIVE_MODE_WRITE &&
+        strcmp(g_active_path, path) == 0 &&
+        g_active_size > out_stat->size) {
+        out_stat->size = g_active_size;
+    }
+
     out_stat->write_time = pack_dos_timestamp(info.wr_date, info.wr_time);
 
     return DOSMNT_STATUS_OK;
@@ -625,6 +656,7 @@ static void process_write(const struct dosmnt_frame *frame) {
     }
 
     data_ptr = frame->payload + data_offset;
+    normalize_path(path);
 
     tracef("[dosmnt] WRITE path=%s offset=%lu len=%u\r\n",
            path, offset, (unsigned)chunk_len);
@@ -650,6 +682,7 @@ static void process_write(const struct dosmnt_frame *frame) {
         strncpy(g_active_path, path, sizeof(g_active_path) - 1);
         g_active_path[sizeof(g_active_path) - 1] = '\0';
         g_active_mode = ACTIVE_MODE_WRITE;
+        g_active_size = get_file_size(g_active_file);
     }
 
     if (fseek(g_active_file, (long)offset, SEEK_SET) != 0) {
@@ -670,6 +703,12 @@ static void process_write(const struct dosmnt_frame *frame) {
     }
 
     fflush(g_active_file);
+    {
+        uint32_t end_pos = offset + chunk_len;
+        if (end_pos > g_active_size) {
+            g_active_size = end_pos;
+        }
+    }
     send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, NULL, 0);
 }
 
@@ -898,6 +937,7 @@ static void reset_active_file(void) {
         g_active_path[0] = '\0';
     }
     g_active_mode = ACTIVE_MODE_NONE;
+    g_active_size = 0;
 }
 
 static int parse_command_line(int argc, char **argv) {
