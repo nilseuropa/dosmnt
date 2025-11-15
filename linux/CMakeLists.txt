@@ -10,6 +10,7 @@ pkg_check_modules(FUSE3 REQUIRED fuse3)
 add_executable(dosmnt
     src/main.c
     src/link.c
+    ../common/src/rle.c
 )
 
 target_include_directories(dosmnt PRIVATE

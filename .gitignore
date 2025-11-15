@@ -1,2 +1,6 @@
 
 linux/build/
+
+dos/main.o
+
+dos/rle.o

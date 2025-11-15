@@ -33,6 +33,11 @@ Commands travel from Linux to DOS with opcodes in the `0x10-0x2F` range; DOS
 responds with the same opcode plus `0x80`. All responses reserve the first byte
 of their payload for a status code (`0` = success).
 
+The `HELLO` handshake advertises capability flags. When both sides request it
+(`dosmnt --compress` / `DOSSRV -c`), file data transferred via `READ`/`WRITE`
+is wrapped in a simple run-length encoding to squeeze a bit more throughput out
+of slow or noisy serial links.
+
 | Command | Payload (request)                                    | Payload (response)                                              |
 | ------- | ----------------------------------------------------- | ---------------------------------------------------------------- |
 | `0x10` (`HELLO`) | `uint8_t version`                                   | status, `uint8_t version`, `uint16_t flags`, 32-byte DOS label   |

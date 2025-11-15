@@ -26,6 +26,7 @@ sudo build/dosmnt \
   --device /dev/ttyUSB0 \
   --mount /mnt/dos \
   --baud 115200 \
+  --compress \
   --drive C \
   --verbose
 ```
@@ -34,6 +35,7 @@ sudo build/dosmnt \
 * `--mount` – target directory on the Linux machine (must exist)
 * `--baud` – serial baud rate (default `115200`)
 * `--drive` – optional DOS drive letter to pin requests to
+* `--compress` / `-c` – enable run-length compression (requires DOS server started with `-c`)
 * `--verbose` / `-v` – print a lightweight activity log (files copied, directories listed, etc.)
 
 The filesystem stays in the foreground (FUSE `-f`). Unmount with

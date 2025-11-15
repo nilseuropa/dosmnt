@@ -15,6 +15,7 @@
 
 #include "dos_serial.h"
 #include "dosmnt/protocol.h"
+#include "dosmnt/rle.h"
 
 #define SERIAL_DEFAULT_PORT 0x3F8
 #define SERIAL_DEFAULT_BAUD 115200UL
@@ -33,8 +34,11 @@ static FILE *g_active_file = NULL;
 static char g_active_path[DOSMNT_MAX_PATH];
 static struct dosmnt_frame g_frame;
 static uint8_t g_response_buffer[DOSMNT_MAX_PAYLOAD];
+static uint8_t g_io_buffer[DOSMNT_MAX_DATA];
 static uint16_t g_serial_port = SERIAL_DEFAULT_PORT;
 static uint32_t g_serial_baud = SERIAL_DEFAULT_BAUD;
+static int g_compress_allowed = 0;
+static int g_compress_active = 0;
 enum active_mode {
     ACTIVE_MODE_NONE = 0,
     ACTIVE_MODE_READ,
@@ -429,11 +433,25 @@ static void process_hello(const struct dosmnt_frame *frame) {
     unsigned drive = 0;
     char pattern[6] = "A:\\*.*";
     int done;
+    uint8_t client_flags = 0;
+    uint16_t server_flags = 0;
+
+    if (frame->length >= 2) {
+        client_flags = frame->payload[1];
+    }
+    if (g_compress_allowed && (client_flags & DOSMNT_HELLO_FLAG_COMPRESS)) {
+        g_compress_active = 1;
+    } else {
+        g_compress_active = 0;
+    }
 
     payload[0] = DOSMNT_STATUS_OK;
     payload[1] = 1; /* protocol version */
-    payload[2] = 0x00; /* filesystem is writable */
-    payload[3] = 0x00;
+    if (g_compress_active) {
+        server_flags |= DOSMNT_FLAG_COMPRESS;
+    }
+    payload[2] = (uint8_t)(server_flags & 0xFF);
+    payload[3] = (uint8_t)(server_flags >> 8);
     memset(payload + 4, 0, 32);
 
     _dos_getdrive(&drive);
@@ -535,7 +553,6 @@ static void process_read(const struct dosmnt_frame *frame) {
     uint16_t chunk_len;
     char path[DOSMNT_MAX_PATH];
     uint8_t status;
-    uint8_t *buffer = g_response_buffer + 1;
     size_t bytes_read;
 
     if (frame->length < 6) {
@@ -588,8 +605,24 @@ static void process_read(const struct dosmnt_frame *frame) {
         return;
     }
 
-    bytes_read = fread(buffer, 1, chunk_len, g_active_file);
-    send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, buffer, (uint16_t)bytes_read);
+    bytes_read = fread(g_io_buffer, 1, chunk_len, g_active_file);
+    if (g_compress_active) {
+        uint8_t *payload = g_response_buffer + 1;
+        size_t comp_len = 0;
+        payload[0] = (uint8_t)(bytes_read & 0xFF);
+        payload[1] = (uint8_t)((bytes_read >> 8) & 0xFF);
+        if (bytes_read > 0) {
+            comp_len = dosmnt_rle_compress(g_io_buffer, bytes_read,
+                                           payload + 2, DOSMNT_MAX_PAYLOAD - 3);
+            if (comp_len == (size_t)-1) {
+                send_status(frame->opcode, frame->seq, DOSMNT_STATUS_INTERNAL, NULL, 0);
+                return;
+            }
+        }
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, payload, (uint16_t)(comp_len + 2));
+    } else {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_OK, g_io_buffer, (uint16_t)bytes_read);
+    }
 }
 
 static uint8_t resize_file(const char *path, uint32_t new_size) {
@@ -650,12 +683,26 @@ static void process_write(const struct dosmnt_frame *frame) {
     }
 
     data_offset = (uint16_t)(6 + path_bytes);
-    if ((uint32_t)data_offset + chunk_len > frame->length) {
+    if ((uint32_t)data_offset > frame->length) {
+        send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
+        return;
+    }
+    if (!g_compress_active && (uint32_t)data_offset + chunk_len > frame->length) {
         send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
         return;
     }
 
     data_ptr = frame->payload + data_offset;
+    if (g_compress_active) {
+        size_t produced = 0;
+        uint16_t compressed_len = (uint16_t)(frame->length - data_offset);
+        if (dosmnt_rle_decompress(data_ptr, compressed_len, g_io_buffer, DOSMNT_MAX_DATA, &produced) != 0 ||
+            produced != chunk_len) {
+            send_status(frame->opcode, frame->seq, DOSMNT_STATUS_MALFORMED, NULL, 0);
+            return;
+        }
+        data_ptr = g_io_buffer;
+    }
     normalize_path(path);
 
     tracef("[dosmnt] WRITE path=%s offset=%lu len=%u\r\n",
@@ -948,7 +995,8 @@ static int parse_command_line(int argc, char **argv) {
 
     for (i = 1; i < argc; ++i) {
         const char *arg = argv[i];
-        const char *value;
+        const char *value = NULL;
+        char option_char;
         char option;
 
         if (arg == NULL || arg[0] == '\0') {
@@ -960,7 +1008,21 @@ static int parse_command_line(int argc, char **argv) {
             return 0;
         }
 
-        option = (char)toupper((unsigned char)arg[1]);
+        option_char = arg[1];
+        if (option_char == '\0') {
+            continue;
+        }
+        if (option_char == 'c') {
+            if (arg[2] != '\0') {
+                printf("Option -c does not take a value.\r\n");
+                print_usage(argv[0]);
+                return 0;
+            }
+            g_compress_allowed = 1;
+            continue;
+        }
+
+        option = (char)toupper((unsigned char)option_char);
         if (option == '?' || option == 'H') {
             print_usage(argv[0]);
             return 0;
@@ -968,17 +1030,18 @@ static int parse_command_line(int argc, char **argv) {
 
         if (arg[2] != '\0') {
             value = &arg[2];
-        } else {
-            if (i + 1 >= argc) {
-                printf("Missing value for -%c\r\n", option);
-                print_usage(argv[0]);
-                return 0;
-            }
-            value = argv[++i];
         }
 
         switch (option) {
             case 'B':
+                if (value == NULL) {
+                    if (i + 1 >= argc) {
+                        printf("Missing value for -%c\r\n", option);
+                        print_usage(argv[0]);
+                        return 0;
+                    }
+                    value = argv[++i];
+                }
                 if (!parse_baud(value, &g_serial_baud)) {
                     printf("Invalid baud rate: %s\r\n", value);
                     print_usage(argv[0]);
@@ -986,6 +1049,14 @@ static int parse_command_line(int argc, char **argv) {
                 }
                 break;
             case 'C':
+                if (value == NULL) {
+                    if (i + 1 >= argc) {
+                        printf("Missing value for -%c\r\n", option);
+                        print_usage(argv[0]);
+                        return 0;
+                    }
+                    value = argv[++i];
+                }
                 if (!parse_com_port(value, &g_serial_port)) {
                     printf("Invalid COM port: %s\r\n", value);
                     print_usage(argv[0]);
@@ -1054,7 +1125,8 @@ static int parse_com_port(const char *value, uint16_t *out) {
 
 static void print_usage(const char *prog_name) {
     const char *name = (prog_name != NULL && prog_name[0] != '\0') ? prog_name : "DOSSRV";
-    printf("Usage: %s [-B baud] [-C COMx]\r\n", name);
+    printf("Usage: %s [-B baud] [-C COMx] [-c]\r\n", name);
     printf("  -B baud   Serial speed in bits per second (default %lu)\r\n", (unsigned long)SERIAL_DEFAULT_BAUD);
     printf("  -C COMx   Serial port (COM1-COM4)\r\n");
+    printf("  -c        Enable run-length compression negotiation\r\n");
 }

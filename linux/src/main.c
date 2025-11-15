@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include "dosmnt/protocol.h"
+#include "dosmnt/rle.h"
 #include "link.h"
 
 struct cli_options {
@@ -26,6 +27,7 @@ struct cli_options {
     char drive;
     int debug;
     int verbose;
+    int compress;
 };
 
 struct dosmnt_context {
@@ -34,6 +36,9 @@ struct dosmnt_context {
     char volume_label[33];
     int debug;
     int verbose;
+    int want_compress;
+    int compress;
+    uint16_t server_flags;
 };
 
 struct dosmnt_file_handle {
@@ -104,7 +109,8 @@ int main(int argc, char **argv) {
         .baud = 115200,
         .drive = 0,
         .debug = 0,
-        .verbose = 0
+        .verbose = 0,
+        .compress = 0
     };
     struct dosmnt_context ctx;
     int fuse_argc = 0;
@@ -124,6 +130,9 @@ int main(int argc, char **argv) {
     }
     ctx.debug = opts.debug;
     ctx.verbose = opts.verbose;
+    ctx.want_compress = opts.compress;
+    ctx.compress = 0;
+    ctx.server_flags = 0;
 
     rc = dosmnt_client_open(&ctx.client, opts.device, opts.baud);
     if (rc != 0) {
@@ -143,6 +152,9 @@ int main(int argc, char **argv) {
     printf("Connected to DOS volume '%s'\n", ctx.volume_label);
     if (ctx.verbose) {
         fprintf(stderr, "[dosmnt] verbose logging enabled\n");
+    }
+    if (ctx.compress) {
+        fprintf(stderr, "[dosmnt] run-length compression enabled\n");
     }
     if (ctx.debug) {
         fprintf(stderr, "[dosmnt] debug trace enabled\n");
@@ -166,6 +178,7 @@ static void usage(const char *prog) {
             "  --mount PATH        Mount point (required)\n"
             "  --baud RATE         Baud rate (default 115200) [alias: -B]\n"
             "  --drive LETTER      DOS drive letter to pin requests\n"
+            "  --compress          Enable run-length compression [alias: -c]\n"
             "  --verbose           Print filesystem activity to stderr [alias: -v]\n"
             "  --debug             Enable verbose tracing\n"
             "Example: %s --device /dev/ttyUSB0 --mount /mnt/dos --drive C -- -f -o allow_other\n",
@@ -179,6 +192,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
         {"mount", required_argument, 0, 'm'},
         {"baud", required_argument, 0, 'b'},
         {"drive", required_argument, 0, 'r'},
+        {"compress", no_argument, 0, 'c'},
         {"verbose", no_argument, 0, 'v'},
         {"debug", no_argument, 0, 'g'},
         {"help", no_argument, 0, 'h'},
@@ -195,7 +209,7 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
     }
     args[idx++] = strdup(argv[0]);
 
-    while ((opt = getopt_long(argc, argv, "d:m:b:B:r:vgh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:m:b:B:r:cvgh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'd':
                 out->device = optarg;
@@ -209,6 +223,9 @@ static int parse_options(int argc, char **argv, struct cli_options *out,
                 break;
             case 'r':
                 out->drive = optarg[0];
+                break;
+            case 'c':
+                out->compress = 1;
                 break;
             case 'v':
                 out->verbose = 1;
@@ -256,13 +273,16 @@ fail:
 }
 
 static int perform_handshake(struct dosmnt_context *ctx) {
-    uint8_t payload = 1;
+    uint8_t payload[2];
     uint8_t status = 0;
     uint8_t response[DOSMNT_MAX_PAYLOAD];
     uint16_t resp_len = sizeof(response);
     int rc;
 
-    rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_HELLO, &payload, 1,
+    payload[0] = 1;
+    payload[1] = ctx->want_compress ? DOSMNT_HELLO_FLAG_COMPRESS : 0;
+
+    rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_HELLO, payload, sizeof(payload),
                                &status, response, &resp_len);
     if (rc != 0) {
         return rc;
@@ -271,6 +291,17 @@ static int perform_handshake(struct dosmnt_context *ctx) {
     if (status != DOSMNT_STATUS_OK || resp_len < 36) {
         return -EIO;
     }
+
+    ctx->server_flags = (uint16_t)response[2] | ((uint16_t)response[3] << 8);
+    if (ctx->want_compress && (ctx->server_flags & DOSMNT_FLAG_COMPRESS) == 0) {
+        fprintf(stderr, "Server does not support compression (restart DOSSRV with -c)\n");
+        return -ENOTSUP;
+    }
+    if (!ctx->want_compress && (ctx->server_flags & DOSMNT_FLAG_COMPRESS) != 0) {
+        fprintf(stderr, "Server requires compression; rerun with --compress\n");
+        return -EPROTONOSUPPORT;
+    }
+    ctx->compress = (ctx->server_flags & DOSMNT_FLAG_COMPRESS) ? 1 : 0;
 
     memcpy(ctx->volume_label, response + 4, 32);
     ctx->volume_label[32] = '\0';
@@ -573,18 +604,42 @@ static int dosmnt_read(const char *path, char *buf, size_t size, off_t offset,
             return (total_read > 0) ? (int)total_read : -EIO;
         }
 
-        resp_len--; /* skip status byte */
-        if (resp_len > chunk) {
-            resp_len = chunk;
-        }
+        if (ctx->compress) {
+            if (resp_len < 3) {
+                return (total_read > 0) ? (int)total_read : -EIO;
+            }
+            uint16_t raw_len = (uint16_t)response[1] | ((uint16_t)response[2] << 8);
+            size_t comp_len = resp_len - 3;
+            size_t produced = 0;
+            if (raw_len > chunk) {
+                return (total_read > 0) ? (int)total_read : -EIO;
+            }
+            if (dosmnt_rle_decompress(response + 3, comp_len,
+                                      (uint8_t *)buf + total_read, chunk,
+                                      &produced) != 0 ||
+                produced != raw_len) {
+                return (total_read > 0) ? (int)total_read : -EIO;
+            }
+            total_read += produced;
+            offset += produced;
+            remaining -= produced;
+            if (produced < chunk) {
+                break;
+            }
+        } else {
+            resp_len--; /* skip status byte */
+            if (resp_len > chunk) {
+                resp_len = chunk;
+            }
 
-        memcpy(buf + total_read, response + 1, resp_len);
-        total_read += resp_len;
-        offset += resp_len;
-        remaining -= resp_len;
+            memcpy(buf + total_read, response + 1, resp_len);
+            total_read += resp_len;
+            offset += resp_len;
+            remaining -= resp_len;
 
-        if (resp_len < chunk) {
-            break; /* EOF */
+            if (resp_len < chunk) {
+                break; /* EOF */
+            }
         }
     }
 
@@ -756,7 +811,7 @@ static int dosmnt_write(const char *path, const char *buf, size_t size, off_t of
             chunk = max_chunk;
         }
 
-        uint8_t payload[6 + DOSMNT_MAX_PATH + DOSMNT_MAX_DATA];
+        uint8_t payload[6 + DOSMNT_MAX_PATH + (DOSMNT_MAX_DATA * 2)];
         uint8_t response[1];
         uint16_t resp_len = sizeof(response);
         uint64_t off64 = (uint64_t)offset + total;
@@ -764,7 +819,8 @@ static int dosmnt_write(const char *path, const char *buf, size_t size, off_t of
             return (total > 0) ? (int)total : -EOVERFLOW;
         }
         uint32_t off = (uint32_t)off64;
-        uint16_t payload_len = (uint16_t)(6 + path_len + chunk);
+        size_t comp_len;
+        uint16_t payload_len;
 
         payload[0] = (uint8_t)(off & 0xFF);
         payload[1] = (uint8_t)((off >> 8) & 0xFF);
@@ -773,7 +829,18 @@ static int dosmnt_write(const char *path, const char *buf, size_t size, off_t of
         payload[4] = (uint8_t)(chunk & 0xFF);
         payload[5] = (uint8_t)((chunk >> 8) & 0xFF);
         memcpy(payload + 6, remote_path, path_len);
-        memcpy(payload + 6 + path_len, buf + total, chunk);
+        if (ctx->compress) {
+            comp_len = dosmnt_rle_compress((const uint8_t *)buf + total, chunk,
+                                           payload + 6 + path_len,
+                                           DOSMNT_MAX_PAYLOAD - (6 + path_len));
+            if (comp_len == (size_t)-1) {
+                return (total > 0) ? (int)total : -EIO;
+            }
+        } else {
+            memcpy(payload + 6 + path_len, buf + total, chunk);
+            comp_len = chunk;
+        }
+        payload_len = (uint16_t)(6 + path_len + comp_len);
 
         int rc = dosmnt_client_request(&ctx->client, DOSMNT_OP_WRITE, payload, payload_len,
                                        &status, response, &resp_len);

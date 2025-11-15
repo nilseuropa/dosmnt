@@ -24,6 +24,7 @@ The executable lands in `build/DOSSRV.EXE`.
 
 * `-C COMx` – pick `COM1`-`COM4` (defaults to `COM1` / 0x3F8).
 * `-B baud` – override the serial speed (defaults to `115200`).
+* `-c` – allow run-length compression when the Linux host requests it.
 
 You can also stick the value right after the flag (`-B57600`, `-CCOM2`) if you
 prefer DOS-style concatenated switches.
